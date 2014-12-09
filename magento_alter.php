@@ -9,7 +9,7 @@ $id_from_old_account = 26362;
 
 //$mg->copy_sales(26362 , 26937);
 
-$mg->copy_guest_sale(39602);
+$mg->copy_guest_sale(37026);
 
 // You'll find the id from the source account in the database in customer_entity.entity_id
 // This script will copy a customer and all his orders - it assumes that the products of the two stores are the same
@@ -301,6 +301,133 @@ class magento_alter
         }
 
         echo "DONE\n";
+    }
+
+    /**
+     * @TODO: Separate concerns from customer in copy_sales so we can use
+     * this method independently of whether a customer is present or not
+     */
+    public function copy_guest_sale($order_id)
+    {
+        // Get tables with a foreign key restraint to the sales_flat_order table
+        $tables = $this->get_sales_restraint_tables( $this->pdo_source );
+
+        $this->log($tables);
+
+        // Get a list of all the primary keys in each table
+        $primary_keys = $this->get_primary_keys($this->pdo_source);
+
+        // Find all tables with 2+ primary keys and get rid of them
+        // If the program exited on this loop, a row has more than 1
+        // primary key and this class is not set up to handle it yet
+        foreach ($tables as $table_name => $column_name)
+        {
+            if (count( $primary_keys[$table_name] ) > 1)
+            {
+                $rowsInTableForOid = $this->pdo_source->query(
+                    'SELECT count(*) FROM ' . $table_name .
+                    ' WHERE ' . $tables[$table_name] . ' = ' . $order_id)->fetchColumn();
+
+                if ( $rowsInTableForOid > 0 )
+                {
+                    echo $table_name . ' has ' . count($primary_keys[$table_name]) . ' primary keys and ' . $result . ' rows' . "\n";
+                    echo 'There are ' . $rowsInTableForOid . ' rows with the order id as the value of the column ' . $tables[$table_name] ;
+                    echo 'exiting, line ' . __LINE__. "\n";exit;
+                }
+            }
+        }
+
+        // First insert the order row into the sales_flat_order table
+        $query_source = "select * from sales_flat_order where entity_id = " . $order_id . ";";
+
+        $this->log($query_source);
+
+        $st = $this->pdo_source->prepare($query_source);
+        $st->execute();
+        $rows = $st->fetchAll(PDO::FETCH_ASSOC);
+
+        foreach ($rows as $row)
+        {
+            // Unset the primary key
+            $source_order_id = $row['entity_id'];
+            unset($row['entity_id']);
+            unset($row['increment_id']);
+
+            // Grab an increment_id
+            $query_increment_id = "select max(increment_id)+1 from sales_flat_order";
+            $increment_id = $this->pdo_target->query($query_increment_id)->fetchColumn();
+            $row['increment_id'] = $increment_id;
+
+            $query_target = "insert into sales_flat_order (" . implode(',', array_keys($row)) . ") values (" . implode(',', array_fill(0, count($row), '?')) . ")";
+
+            $params = array();
+            foreach ( $row as $key=>$value)
+            {
+                $params[] = $value;
+            }
+
+            $st = $this->pdo_target->prepare($query_target);
+            $st->execute( $params );
+
+            $target_order_id = $this->pdo_target->lastInsertId();
+
+            if($target_order_id == 0) {
+                $this->log("Something went wrong, customer not set!");
+                $this->log($st->errorInfo());
+                exit;
+            }
+
+            $this->log("Order Inserted to target with entity_id = $target_order_id");
+
+            // Return the last_insert_id and use it for the other tables
+            $this->log("Migrate order_id: $order_id => $target_order_id");
+
+            // These are tables we can work with
+            foreach ($tables as $table_name => $column_name)
+            {
+                // Get rows from source where the source order id is present
+                $this->log($table_name . ' ' . $column_name);
+                $query_source = "select * from " . $table_name . " where " . $column_name . " = " . $source_order_id . ";";
+
+                $this->log($query_source);
+
+                $st = $this->pdo_source->prepare($query_source);
+                $st->execute();
+
+                foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $row2)
+                {
+                    // Get rid of the primary key
+                    unset( $row2[$primary_keys[$table_name][0]] );
+
+                    // Replace foreign restraint with the new client id
+                    $row2[$column_name] = $target_order_id;
+
+                    $query_target = "insert into " . $table_name . " (" . implode(',', array_keys($row2)) . ") values (" . implode(',', array_fill(0, count($row2), '?')) . ")";
+
+                    $this->log($query_target);
+
+                    // Create parameters for ->execute() call
+                    $params = array();
+                    foreach ( $row2 as $key=>$value)
+                    {
+                        $params[] = $value;
+                    }
+
+                    $this->log(implode($params, ','));
+
+                    $st = $this->pdo_target->prepare($query_target);
+                    $st->execute( $params );
+
+                    $last_insert_id = $this->pdo_target->lastInsertId();
+
+                    $this->log("Last insert id: $last_insert_id");
+                }
+
+            }
+
+        }
+
+        echo "DONE WITH order id " . $target_order_id . "\n";
     }
 
     // Find tables that have foreign restraint to the $table in question
